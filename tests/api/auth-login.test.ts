@@ -1,12 +1,14 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+﻿import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   verify: vi.fn(),
-  findUnique: vi.fn(),
+  schoolFindUnique: vi.fn(),
+  userFindUnique: vi.fn(),
   update: vi.fn(),
   auditCreate: vi.fn(),
   transaction: vi.fn(),
   createAuthToken: vi.fn(),
+  countFailed: vi.fn(),
 }));
 
 vi.mock("argon2", () => ({
@@ -15,13 +17,20 @@ vi.mock("argon2", () => ({
 
 vi.mock("@/lib/prisma", () => ({
   prisma: {
-    user: {
-      findUnique: mocks.findUnique,
-      update: mocks.update,
-    },
-    auditLog: { create: mocks.auditCreate },
+    school: { findUnique: mocks.schoolFindUnique },
+    user: { findUnique: mocks.userFindUnique, update: mocks.update },
+    auditLog: { create: mocks.auditCreate, count: mocks.countFailed },
     $transaction: mocks.transaction,
   },
+}));
+
+vi.mock("@/lib/rate-limit", () => ({
+  isRateLimited: async (keys: (string | null)[]) => {
+    if (!keys.length) return false;
+    const count = await mocks.countFailed();
+    return count >= 5;
+  },
+  recordAccountFailure: async () => {},
 }));
 
 vi.mock("@/lib/auth", () => ({
@@ -39,13 +48,22 @@ vi.mock("@/lib/auth", () => ({
 
 const { POST } = await import("@/app/api/auth/login/route");
 
+const school = {
+  id: "school-1",
+  code: "SCH",
+  name: "SMA Negeri 1",
+  isActive: true,
+};
+
 const activeUser = {
   id: "user-1",
+  schoolId: "school-1",
   username: "librarian",
   passwordHash: "hashed-password",
   name: "Librarian",
   role: "PUSTAKAWAN",
   status: "AKTIF",
+  mustChangePassword: false,
 };
 
 function requestWithBody(body: unknown) {
@@ -64,8 +82,10 @@ async function expectJsonError(response: Response, status: number, error: string
 
 beforeEach(() => {
   vi.resetAllMocks();
+  mocks.countFailed.mockResolvedValue(0);
   mocks.createAuthToken.mockResolvedValue("signed-auth-token");
-  mocks.findUnique.mockResolvedValue(activeUser);
+  mocks.schoolFindUnique.mockResolvedValue(school);
+  mocks.userFindUnique.mockResolvedValue(activeUser);
   mocks.verify.mockResolvedValue(true);
   mocks.update.mockResolvedValue({});
   mocks.auditCreate.mockResolvedValue({});
@@ -85,7 +105,8 @@ describe("POST /api/auth/login", () => {
       400,
       "Body JSON tidak valid.",
     );
-    expect(mocks.findUnique).not.toHaveBeenCalled();
+    expect(mocks.schoolFindUnique).not.toHaveBeenCalled();
+    expect(mocks.userFindUnique).not.toHaveBeenCalled();
   });
 
   it.each([null, [], "invalid-body", 123])(
@@ -100,27 +121,55 @@ describe("POST /api/auth/login", () => {
   );
 
   it.each([
-    { username: "", password: "valid-password" },
-    { username: "librarian", password: "" },
-    { username: "   ", password: "valid-password" },
-    { username: "librarian" },
-    { password: "valid-password" },
-    { username: "librarian", password: "x".repeat(257) },
-    { username: "x".repeat(101), password: "valid-password" },
+    { schoolCode: "", username: "librarian", password: "valid-password" },
+    { schoolCode: "SCH", username: "", password: "valid-password" },
+    { schoolCode: "SCH", username: "librarian", password: "" },
+    { schoolCode: "   ", username: "librarian", password: "valid-password" },
+    { schoolCode: "SCH", username: "librarian" },
+    { username: "librarian", password: "valid-password" },
+    { schoolCode: "SCH", username: "librarian", password: "x".repeat(257) },
+    { schoolCode: "SCH", username: "x".repeat(101), password: "valid-password" },
+    { schoolCode: "S".repeat(101), username: "librarian", password: "valid-password" },
   ])("returns 401 for invalid credentials: %j", async (body) => {
     await expectJsonError(
       await POST(requestWithBody(body)),
       401,
       "Username atau password salah.",
     );
-    expect(mocks.findUnique).not.toHaveBeenCalled();
+    expect(mocks.schoolFindUnique).not.toHaveBeenCalled();
+    expect(mocks.userFindUnique).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when school does not exist and skips user lookup", async () => {
+    mocks.schoolFindUnique.mockResolvedValue(null);
+
+    await expectJsonError(
+      await POST(requestWithBody({ schoolCode: "UNKNOWN", username: "librarian", password: "wrong-password" })),
+      401,
+      "Username atau password salah.",
+    );
+    expect(mocks.verify).toHaveBeenCalledWith(expect.any(String), "wrong-password");
+    expect(mocks.userFindUnique).not.toHaveBeenCalled();
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.createAuthToken).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 when school is inactive", async () => {
+    mocks.schoolFindUnique.mockResolvedValue({ ...school, isActive: false });
+
+    await expectJsonError(
+      await POST(requestWithBody({ schoolCode: "SCH", username: "librarian", password: "correct-password" })),
+      401,
+      "Username atau password salah.",
+    );
+    expect(mocks.createAuthToken).not.toHaveBeenCalled();
   });
 
   it("returns 401 when user does not exist", async () => {
-    mocks.findUnique.mockResolvedValue(null);
+    mocks.userFindUnique.mockResolvedValue(null);
 
     await expectJsonError(
-      await POST(requestWithBody({ username: "unknown", password: "wrong-password" })),
+      await POST(requestWithBody({ schoolCode: "SCH", username: "unknown", password: "wrong-password" })),
       401,
       "Username atau password salah.",
     );
@@ -133,7 +182,7 @@ describe("POST /api/auth/login", () => {
     mocks.verify.mockResolvedValue(false);
 
     await expectJsonError(
-      await POST(requestWithBody({ username: "librarian", password: "wrong-password" })),
+      await POST(requestWithBody({ schoolCode: "SCH", username: "librarian", password: "wrong-password" })),
       401,
       "Username atau password salah.",
     );
@@ -142,10 +191,10 @@ describe("POST /api/auth/login", () => {
   });
 
   it("returns 401 when user is inactive", async () => {
-    mocks.findUnique.mockResolvedValue({ ...activeUser, status: "NONAKTIF" });
+    mocks.userFindUnique.mockResolvedValue({ ...activeUser, status: "NONAKTIF" });
 
     await expectJsonError(
-      await POST(requestWithBody({ username: "librarian", password: "correct-password" })),
+      await POST(requestWithBody({ schoolCode: "SCH", username: "librarian", password: "correct-password" })),
       401,
       "Username atau password salah.",
     );
@@ -153,28 +202,34 @@ describe("POST /api/auth/login", () => {
     expect(mocks.createAuthToken).not.toHaveBeenCalled();
   });
 
-  it("trims username before database lookup", async () => {
+  it("looks up school by code and user by trimmed username", async () => {
     const response = await POST(
-      requestWithBody({ username: "  librarian  ", password: "correct-password" }),
+      requestWithBody({ schoolCode: "  SCH  ", username: "  librarian  ", password: "correct-password" }),
     );
 
     expect(response.status).toBe(200);
-    expect(mocks.findUnique).toHaveBeenCalledWith({
-      where: { username: "librarian" },
+    expect(mocks.schoolFindUnique).toHaveBeenCalledWith({
+      where: { code: "SCH" },
+      select: { id: true, code: true, name: true, isActive: true },
+    });
+    expect(mocks.userFindUnique).toHaveBeenCalledWith({
+      where: { schoolId_username: { schoolId: "school-1", username: "librarian" } },
       select: {
         id: true,
+        schoolId: true,
         username: true,
         passwordHash: true,
         name: true,
         role: true,
         status: true,
+        mustChangePassword: true,
       },
     });
   });
 
   it("ignores unknown body fields", async () => {
     const response = await POST(
-      requestWithBody({ username: "librarian", password: "correct-password", ignored: true }),
+      requestWithBody({ schoolCode: "SCH", username: "librarian", password: "correct-password", ignored: true }),
     );
 
     expect(response.status).toBe(200);
@@ -184,16 +239,16 @@ describe("POST /api/auth/login", () => {
     const response = await POST(new Request("http://localhost/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({ username: "librarian", password: "correct-password" }),
+      body: JSON.stringify({ schoolCode: "SCH", username: "librarian", password: "correct-password" }),
     }));
 
     await expectJsonError(response, 415, "Content-Type harus application/json.");
-    expect(mocks.findUnique).not.toHaveBeenCalled();
+    expect(mocks.schoolFindUnique).not.toHaveBeenCalled();
   });
 
-  it("returns authenticated user and sets auth cookie", async () => {
+  it("returns authenticated user, school, and sets auth cookie", async () => {
     const response = await POST(
-      requestWithBody({ username: "librarian", password: "correct-password" }),
+      requestWithBody({ schoolCode: "SCH", username: "librarian", password: "correct-password" }),
     );
 
     expect(response.status).toBe(200);
@@ -204,6 +259,7 @@ describe("POST /api/auth/login", () => {
         name: "Librarian",
         role: "PUSTAKAWAN",
       },
+      school,
     });
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(mocks.verify).toHaveBeenCalledWith("hashed-password", "correct-password");
@@ -213,6 +269,7 @@ describe("POST /api/auth/login", () => {
     });
     expect(mocks.createAuthToken).toHaveBeenCalledWith({
       userId: "user-1",
+      schoolId: "school-1",
       role: "PUSTAKAWAN",
     });
 
@@ -223,8 +280,20 @@ describe("POST /api/auth/login", () => {
     expect(cookie).toContain("Path=/");
   });
 
+  it("returns 429 when rate limited", async () => {
+    mocks.countFailed.mockResolvedValue(5);
+
+    await expectJsonError(
+      await POST(requestWithBody({ schoolCode: "SCH", username: "librarian", password: "correct-password" })),
+      429,
+      "Terlalu banyak percobaan login. Coba lagi nanti.",
+    );
+    expect(mocks.verify).not.toHaveBeenCalled();
+    expect(mocks.schoolFindUnique).not.toHaveBeenCalled();
+  });
+
   it.each([
-    ["database lookup", () => mocks.findUnique.mockRejectedValue(new Error("database unavailable"))],
+    ["database lookup", () => mocks.schoolFindUnique.mockRejectedValue(new Error("database unavailable"))],
     ["password verification", () => mocks.verify.mockRejectedValue(new Error("argon2 failure"))],
     ["last login update", () => mocks.update.mockRejectedValue(new Error("database unavailable"))],
     ["token creation", () => mocks.createAuthToken.mockRejectedValue(new Error("token failure"))],
@@ -232,7 +301,7 @@ describe("POST /api/auth/login", () => {
     configureFailure();
 
     await expectJsonError(
-      await POST(requestWithBody({ username: "librarian", password: "correct-password" })),
+      await POST(requestWithBody({ schoolCode: "SCH", username: "librarian", password: "correct-password" })),
       500,
       "Terjadi kesalahan pada server.",
     );

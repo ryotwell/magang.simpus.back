@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getBookCoverUrl } from "@/lib/book-cover-url";
+import { deleteBookCover } from "@/lib/book-cover-storage";
 import { noStoreHeaders, requireAuthenticatedUser, requireLibrarian } from "@/lib/auth";
 import {
   getClientIp,
@@ -8,7 +10,7 @@ import {
   isRecord,
   isUuid,
   normalizeText,
-  parseHttpsUrl,
+  parseBookCoverUrl,
   parseOptionalString,
   parseRequiredString,
 } from "@/lib/validation";
@@ -38,8 +40,9 @@ export async function GET(_request: Request, context: Context) {
   const { id } = await context.params;
   if (!isUuid(id)) return errorResponse("ID buku tidak valid.", 422);
   try {
-    const data = await prisma.book.findFirst({ where: { id, isActive: true, category: { is: { isActive: true } } }, select: detailSelect });
-    return data ? NextResponse.json({ data }, { headers: noStoreHeaders }) : errorResponse("Buku tidak ditemukan.", 404);
+    const data = await prisma.book.findFirst({ where: { id, schoolId: auth.schoolId, isActive: true, category: { is: { isActive: true } } }, select: detailSelect });
+    if (!data) return errorResponse("Buku tidak ditemukan.", 404);
+    return NextResponse.json({ data: { ...data, coverUrl: await getBookCoverUrl(data.coverUrl) } }, { headers: noStoreHeaders });
   } catch { return errorResponse("Terjadi kesalahan pada server.", 500); }
 }
 
@@ -78,7 +81,7 @@ export async function PATCH(request: Request, context: Context) {
     }
   }
   if ("coverUrl" in body) {
-    const result = parseHttpsUrl(body.coverUrl, "URL sampul");
+    const result = parseBookCoverUrl(body.coverUrl, "URL sampul");
     if (!result.ok) return errorResponse(result.error, 422);
     data.coverUrl = result.value;
   }
@@ -95,20 +98,24 @@ export async function PATCH(request: Request, context: Context) {
   if (!Object.keys(data).length && authorIds === undefined) return errorResponse("Tidak ada perubahan.", 422);
 
   try {
-    const updated = await prisma.$transaction(async (tx) => {
-      const current = await tx.book.findFirst({ where: { id, isActive: true }, select: detailSelect });
+    const result = await prisma.$transaction(async (tx) => {
+      const current = await tx.book.findFirst({ where: { id, schoolId: auth.schoolId, isActive: true }, select: detailSelect });
       if (!current) return null;
-      if (data.categoryId && !(await tx.category.findFirst({ where: { id: data.categoryId, isActive: true }, select: { id: true } }))) throw new Error("CATEGORY_NOT_FOUND");
+      if (data.categoryId && !(await tx.category.findFirst({ where: { id: data.categoryId, schoolId: auth.schoolId, isActive: true }, select: { id: true } }))) throw new Error("CATEGORY_NOT_FOUND");
       const uniqueAuthors = authorIds === undefined ? undefined : [...new Set(authorIds)];
       if (uniqueAuthors) {
-        const count = await tx.author.count({ where: { id: { in: uniqueAuthors } } });
+        const count = await tx.author.count({ where: { id: { in: uniqueAuthors }, schoolId: auth.schoolId } });
         if (count !== uniqueAuthors.length) throw new Error("AUTHOR_NOT_FOUND");
       }
-      const book = await tx.book.update({ where: { id }, data: { ...data, ...(uniqueAuthors ? { authors: { set: uniqueAuthors.map((authorId) => ({ id: authorId })) } } : {}) }, select: detailSelect });
-      await tx.auditLog.create({ data: { userId: auth.user.id, action: "UPDATE", entityType: "Book", entityId: id, oldData: jsonValue(current), newData: jsonValue(book), ipAddress: getClientIp(request) } });
-      return book;
+      const book = await tx.book.update({ where: { id, schoolId: auth.schoolId }, data: { ...data, ...(uniqueAuthors ? { authors: { set: uniqueAuthors.map((authorId) => ({ id: authorId })) } } : {}) }, select: detailSelect });
+      await tx.auditLog.create({ data: { schoolId: auth.schoolId, userId: auth.user.id, action: "UPDATE", entityType: "Book", entityId: id, oldData: jsonValue(current), newData: jsonValue(book), ipAddress: getClientIp(request) } });
+      return { book, previousCoverUrl: current.coverUrl };
     });
-    return updated ? NextResponse.json({ data: updated }, { headers: noStoreHeaders }) : errorResponse("Buku tidak ditemukan.", 404);
+    if (!result) return errorResponse("Buku tidak ditemukan.", 404);
+    if ("coverUrl" in data && data.coverUrl !== result.previousCoverUrl) {
+      await deleteBookCover(result.previousCoverUrl);
+    }
+    return NextResponse.json({ data: { ...result.book, coverUrl: await getBookCoverUrl(result.book.coverUrl) } }, { headers: noStoreHeaders });
   } catch (error: unknown) {
     if (error instanceof Error && error.message === "CATEGORY_NOT_FOUND") return errorResponse("Kategori tidak ditemukan.", 422);
     if (error instanceof Error && error.message === "AUTHOR_NOT_FOUND") return errorResponse("Salah satu penulis tidak ditemukan.", 422);
@@ -124,10 +131,10 @@ export async function DELETE(request: Request, context: Context) {
   if (!isUuid(id)) return errorResponse("ID buku tidak valid.", 422);
   try {
     const deleted = await prisma.$transaction(async (tx) => {
-      const current = await tx.book.findFirst({ where: { id, isActive: true }, select: detailSelect });
+      const current = await tx.book.findFirst({ where: { id, schoolId: auth.schoolId, isActive: true }, select: detailSelect });
       if (!current) return false;
-      await tx.book.update({ where: { id }, data: { isActive: false } });
-      await tx.auditLog.create({ data: { userId: auth.user.id, action: "DEACTIVATE", entityType: "Book", entityId: id, oldData: jsonValue(current), newData: jsonValue({ ...current, isActive: false }), ipAddress: getClientIp(request) } });
+      await tx.book.update({ where: { id, schoolId: auth.schoolId }, data: { isActive: false } });
+      await tx.auditLog.create({ data: { schoolId: auth.schoolId, userId: auth.user.id, action: "DEACTIVATE", entityType: "Book", entityId: id, oldData: jsonValue(current), newData: jsonValue({ ...current, isActive: false }), ipAddress: getClientIp(request) } });
       return true;
     });
     return deleted ? new NextResponse(null, { status: 204 }) : errorResponse("Buku tidak ditemukan.", 404);

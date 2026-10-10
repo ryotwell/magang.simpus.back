@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { getBookCoverUrl } from "@/lib/book-cover-url";
 import { noStoreHeaders, requireAuthenticatedUser, requireLibrarian } from "@/lib/auth";
 import {
   getClientIp,
@@ -9,7 +10,7 @@ import {
   isUuid,
   normalizeText,
   parseEnum,
-  parseHttpsUrl,
+  parseBookCoverUrl,
   parseOptionalString,
   parsePagination,
   parseRequiredString,
@@ -23,6 +24,10 @@ function errorResponse(error: string, status: number) {
 
 function jsonValue(value: unknown) {
   return JSON.parse(JSON.stringify(value));
+}
+
+async function withCoverUrl<T extends { coverUrl: string | null }>(book: T) {
+  return { ...book, coverUrl: await getBookCoverUrl(book.coverUrl) };
 }
 
 const bookSelect = {
@@ -54,6 +59,7 @@ export async function GET(request: Request) {
   if (statusResult && !statusResult.ok) return errorResponse(statusResult.error, 422);
 
   const where = {
+    schoolId: auth.schoolId,
     isActive: true,
     category: { is: { isActive: true } },
     ...(categoryId ? { categoryId } : {}),
@@ -73,10 +79,14 @@ export async function GET(request: Request) {
 
   try {
     const [data, total] = await prisma.$transaction([
-      prisma.book.findMany({ where, select: bookSelect, orderBy: [{ createdAt: "desc" }, { id: "desc" }], skip: (page - 1) * limit, take: limit }),
-      prisma.book.count({ where }),
+      prisma.book.findMany({ where: { ...where, schoolId: auth.schoolId }, select: bookSelect, orderBy: [{ createdAt: "desc" }, { id: "desc" }], skip: (page - 1) * limit, take: limit }),
+      prisma.book.count({ where: { ...where, schoolId: auth.schoolId } }),
     ]);
-    return NextResponse.json({ data: data.map(({ _count, ...book }) => ({ ...book, copyCount: _count.copies })), pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } }, { headers: noStoreHeaders });
+    const books = await Promise.all(data.map(async ({ _count, ...book }) => ({
+      ...(await withCoverUrl(book)),
+      copyCount: _count.copies,
+    })));
+    return NextResponse.json({ data: books, pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } }, { headers: noStoreHeaders });
   } catch {
     return errorResponse("Terjadi kesalahan pada server.", 500);
   }
@@ -96,7 +106,7 @@ export async function POST(request: Request) {
   const publisherResult = parseOptionalString(body.publisher, { field: "Penerbit", maxLength: 200 });
   const editionResult = parseOptionalString(body.edition, { field: "Edisi", maxLength: 100 });
   const descriptionResult = parseOptionalString(body.description, { field: "Deskripsi", maxLength: 5000 });
-  const coverResult = parseHttpsUrl(body.coverUrl, "URL sampul");
+  const coverResult = parseBookCoverUrl(body.coverUrl, "URL sampul");
   const categoryId = body.categoryId;
   const authorIds = body.authorIds;
   const publicationYear = body.publicationYear === undefined || body.publicationYear === null ? null : body.publicationYear;
@@ -113,16 +123,16 @@ export async function POST(request: Request) {
   try {
     const data = await prisma.$transaction(async (tx) => {
       const [category, authors] = await Promise.all([
-        tx.category.findFirst({ where: { id: categoryId, isActive: true }, select: { id: true } }),
-        tx.author.findMany({ where: { id: { in: uniqueAuthorIds } }, select: { id: true } }),
+        tx.category.findFirst({ where: { id: categoryId, schoolId: auth.schoolId, isActive: true }, select: { id: true } }),
+        tx.author.findMany({ where: { id: { in: uniqueAuthorIds }, schoolId: auth.schoolId }, select: { id: true } }),
       ]);
       if (!category) throw new Error("CATEGORY_NOT_FOUND");
       if (authors.length !== uniqueAuthorIds.length) throw new Error("AUTHOR_NOT_FOUND");
-      const book = await tx.book.create({ data: { isbn, title, publisher, publicationYear, edition, description, coverUrl, categoryId, authors: { connect: uniqueAuthorIds.map((id) => ({ id })) } }, select: bookSelect });
-      await tx.auditLog.create({ data: { userId: auth.user.id, action: "CREATE", entityType: "Book", entityId: book.id, newData: jsonValue(book), ipAddress: getClientIp(request) } });
+      const book = await tx.book.create({ data: { schoolId: auth.schoolId, isbn, title, publisher, publicationYear, edition, description, coverUrl, categoryId, authors: { connect: uniqueAuthorIds.map((id) => ({ id })) } }, select: bookSelect });
+      await tx.auditLog.create({ data: { schoolId: auth.schoolId, userId: auth.user.id, action: "CREATE", entityType: "Book", entityId: book.id, newData: jsonValue(book), ipAddress: getClientIp(request) } });
       return book;
     });
-    return NextResponse.json({ data }, { status: 201, headers: noStoreHeaders });
+    return NextResponse.json({ data: await withCoverUrl(data) }, { status: 201, headers: noStoreHeaders });
   } catch (error: unknown) {
     if (error instanceof Error && error.message === "CATEGORY_NOT_FOUND") return errorResponse("Kategori tidak ditemukan.", 422);
     if (error instanceof Error && error.message === "AUTHOR_NOT_FOUND") return errorResponse("Salah satu penulis tidak ditemukan.", 422);
